@@ -1,160 +1,112 @@
-# MQTT Communication Service
+# Sorting Service & Device Simulation (Member 3)
 
-Messaging backbone for the factory production-line project (product inspection and sorting).
-Built with Eclipse Mosquitto (Docker) and Python (Paho MQTT 2.x).
+This part of the project decides where each inspected product goes (accept, reject, or review bin) and simulates the physical sorting device. It is built on top of the MQTT communication layer (`src/mqtt_service`) written by Member 1.
 
-## Architecture
+## What it does
 
-```
- Other services (inspection, sorter, dashboard...)
-        |  use the Python library, or any MQTT client
-        v
- +--------------------------------------------+
- |  mqtt_service (Python, Paho MQTT)          |
- |  config - topics - messages                |
- |  publisher - subscriber (auto-reconnect)   |
- +----------------------+---------------------+
-                        | TCP 1883
- +----------------------v---------------------+
- |  Mosquitto broker (Docker container)       |
- +--------------------------------------------+
-```
-
-Services never talk to each other directly. A publisher sends a message to a topic and the broker delivers it to every subscriber of that topic.
-
-## Project structure
-
-```
-docker-compose.yml          broker definition
-mosquitto/config/           mosquitto.conf
-src/mqtt_service/           config.py, topics.py, messages.py, publisher.py, subscriber.py
-examples/                   demo scripts
-tests/                      pytest tests
-```
-
-## Installation (Windows 11)
-
-Requirements: Docker Desktop (WSL 2), Python 3.10+, Git.
-
-```powershell
-git clone <repo-url>
-cd mqtt-communication
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-docker compose up -d
-```
-
-## Running
-
-```powershell
-$env:PYTHONPATH = "src"
-python examples\run_subscriber.py      # terminal 1
-python examples\run_publisher.py       # terminal 2
-python examples\run_lastwill_demo.py   # Last Will demo
-python -m pytest tests -v              # tests
-```
-
-Stop the broker: `docker compose stop`. View logs: `docker compose logs`.
-
-## Configuration
-
-Environment variables (defaults in `src/mqtt_service/config.py`):
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `MQTT_HOST` | `localhost` | Broker address |
-| `MQTT_PORT` | `1883` | Broker port |
-
-To connect from another machine, set `MQTT_HOST` to the IP of the machine running Docker (and allow port 1883 in Windows Firewall).
+1. **Sorting Service** (`src/sorting_service/sorter.py`) listens for inspection results, decides the bin, and publishes a sort command.
+2. **Device Simulator** (`src/sorting_service/simulator.py`) listens for sort commands, simulates the diverter moving, and publishes its status.
+3. **Retry logic**: if the device reports `ERROR`, the Sorting Service resends the command up to 2 times. If it still fails, the product is redirected to the review bin. If even that fails, an error is published to `factory/system/error`.
 
 ## Topics
 
-| Purpose | Topic | QoS | Retained |
-|---|---|---|---|
-| Inspection results | `factory/inspection/result` | 1 | No |
-| Sorting commands | `factory/sorter/command` | 1 | No |
-| Device status | `factory/device/<device_id>/status` | 1 | Yes |
-| System errors | `factory/system/error` | 1 | No |
+| Direction | Topic | Used by |
+|---|---|---|
+| Subscribe | `factory/inspection/result` | Sorting Service |
+| Subscribe | `factory/device/+/status` | Sorting Service |
+| Publish | `factory/sorter/command` | Sorting Service |
+| Publish | `factory/system/error` | Sorting Service |
+| Subscribe | `factory/sorter/command` | Simulator |
+| Publish | `factory/device/<device_id>/status` | Simulator |
 
-Subscribe to all device statuses with `factory/device/+/status`.
+## Decision table
 
-## JSON message format
+| Condition | Action | Bin |
+|---|---|---|
+| `status = pass` and `confidence >= 0.8` | `accept` | 1 |
+| `status = fail` and `confidence >= 0.8` | `reject` | 2 |
+| `confidence < 0.8` | `review` | 3 |
+| Unknown status | `review` | 3 |
 
-Every message uses the same envelope:
+The threshold and bin numbers are constants at the top of `sorter.py`.
+
+## Device states
+
+| State | Meaning |
+|---|---|
+| `IDLE` | Waiting for a command |
+| `MOVING` | Diverter is moving (about 1 second) |
+| `DONE` | Product placed in the bin |
+| `ERROR` | Random failure (20% chance) |
+
+## Message examples
+
+Sort command (published by the Sorting Service):
 
 ```json
 {
-  "message_id": "bffa3002-6dcb-44c7-afca-087026f5e144",
-  "product_id": "P-1001",
-  "timestamp": "2026-11-23T01:12:10.823761+00:00",
-  "event_type": "inspection_result",
-  "data": {"status": "pass", "defect_type": null, "confidence": 0.97},
-  "source": "camera-01"
+  "message_id": "uuid",
+  "product_id": "P-2001",
+  "timestamp": "2026-11-24T11:09:20+00:00",
+  "event_type": "sort_command",
+  "data": {"action": "accept", "target_bin": 1},
+  "source": "sorter-01"
 }
 ```
 
-| Field | Required | Meaning |
-|---|---|---|
-| `message_id` | yes | Unique UUID. Used to detect duplicates (QoS 1 may deliver twice) and for tracing |
-| `product_id` | yes | Product the message is about; `null` if not tied to a product (e.g. device status) |
-| `timestamp` | yes | Creation time, UTC, ISO 8601 |
-| `event_type` | yes | `inspection_result`, `sort_command`, `device_status`, `system_error` |
-| `data` | yes | Payload object, depends on `event_type` |
-| `source` | no | Name of the sending service/device |
+Device status (published by the Simulator):
 
-`data` per event type (**assumed defaults, to be agreed with the team**):
-
-- `inspection_result`: `status` (`pass`/`fail`), `defect_type`, `confidence` (0 to 1)
-- `sort_command`: `action` (`accept`/`reject`), `target_bin`
-- `device_status`: `state` (`online`/`offline`)
-- `system_error`: `code`, `message`
-
-## Reliability
-
-- **QoS 1** (at least once) for results, commands and errors: losing one means a mis-sorted product. Duplicates are possible, so receivers can deduplicate by `message_id`.
-- **Retained messages**: the broker stores the last message of a topic and gives it to any new subscriber immediately. Used for device status so late joiners know the current state. Persisted to disk (`persistence true`).
-- **Last Will**: a message registered at connect time. If the client dies without a clean disconnect, the broker publishes it. Each device registers `{"state": "offline"}` on its status topic. Note: its `timestamp` is the registration time, not the time of death.
-- **Reconnect**: Paho reconnects automatically (delay 1s to 30s). The Subscriber re-subscribes on every connect, because the broker forgets subscriptions after a restart. Malformed messages are logged and skipped.
-
-## Using the library
-
-```python
-from mqtt_service import messages, topics
-from mqtt_service.publisher import Publisher
-from mqtt_service.subscriber import Subscriber
-
-pub = Publisher(client_id="camera-01")
-pub.set_last_will("camera-01")
-pub.connect()
-pub.announce_online("camera-01")
-pub.publish(topics.INSPECTION_RESULT, messages.INSPECTION_RESULT,
-            {"status": "pass", "defect_type": None, "confidence": 0.97},
-            product_id="P-1001", source="camera-01")
-
-def handler(topic, message):
-    print(topic, message["data"])
-
-sub = Subscriber(client_id="sorter-01")
-sub.subscribe(topics.INSPECTION_RESULT.name, handler)
-sub.run_forever()
+```json
+{
+  "message_id": "uuid",
+  "product_id": "P-2001",
+  "timestamp": "2026-11-24T11:09:21+00:00",
+  "event_type": "device_status",
+  "data": {"state": "online", "operation_state": "DONE", "target_bin": 1},
+  "source": "diverter-01"
+}
 ```
 
-Not using Python? Any MQTT client works: connect to `<broker-ip>:1883` and use the topics and JSON above.
+The `operation_state` field is an extension added to the `device_status` data. The `review` action is an extension added to the `sort_command` data.
 
-## Manual test scenarios
+## Robustness
 
-| # | Scenario | Command | Expected |
-|---|---|---|---|
-| 1 | Broker up | `docker compose ps` | `Up`, port `1883` |
-| 2 | Simple pub/sub | `mosquitto_sub` / `mosquitto_pub` on `test/hello` | `test/hello Hello MQTT` |
-| 3 | JSON + multiple topics | run subscriber, then publisher | 4 lines (inspection, sorter, device, error) |
-| 4 | Malformed message | publish `garbage` to `factory/inspection/result` | ERROR logged, subscriber keeps running |
-| 5 | Retained | `docker exec mosquitto mosquitto_sub -t factory/device/camera-01/status -C 1` | last state immediately |
-| 6 | Last Will | `run_lastwill_demo.py` | `online`, then `offline` after about 1.5 x keepalive |
-| 7 | Reconnect | `docker compose stop`, wait, `docker compose start` | warning, then reconnect and 4 re-subscriptions |
-| 8 | Automated tests | `python -m pytest tests -v` | `10 passed` |
+- Malformed inspection data is logged and skipped, the service does not crash.
+- Duplicate messages (same `message_id`) are ignored.
+- MQTT reconnection is handled by the Subscriber from Member 1.
 
-## Security note
+## How to run (Windows PowerShell)
 
-The broker is anonymous and unencrypted (development only). For production use `password_file` and TLS (port 8883).
+Requirements: Docker Desktop, Python 3.10+, Git.
+
+```
+git clone https://github.com/abdelrahman-ahmed07/distributed-systems-sorting-simulation
+cd distributed-systems-sorting-simulation
+pip install -r requirements.txt
+docker compose up -d
+$env:PYTHONPATH = "src"
+```
+
+Then run each in its own PowerShell window:
+
+```
+python -m sorting_service.simulator
+python -m sorting_service.sorter
+python examples\test_decisions.py
+```
+
+## How to test
+
+```
+$env:PYTHONPATH = "src"
+python -m pytest tests -v
+```
+
+Result: 21 passed (10 from the MQTT layer, 11 for the Sorting Service).
+
+## Notes for other members
+
+- Member 2 (Database): store `product_id`, `action`, `target_bin`, and the final device state (`DONE` or `ERROR`).
+- Member 4 (Integration): useful events for the WebSocket bridge are the sort command, the device status (`operation_state`), and `factory/system/error`.
+## Credits
+The MQTT communication layer (src/mqtt_service) was written by Member 1 (Amar Yasser). See README_MQTT.md.
